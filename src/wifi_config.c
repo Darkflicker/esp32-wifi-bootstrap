@@ -274,7 +274,55 @@ static void client_send_index(client_t *client) {
 }
 
 
+static TaskHandle_t wifi_monitor_task_handle = NULL;
 
+static void wifi_monitor_task(void *arg) {
+        for (;;) {
+                /* Wait until timer tells us to run */
+                ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+                /* ---- original timer logic moved here ---- */
+
+                if (sdk_wifi_station_get_connect_status() == STATION_GOT_IP) {
+                        if (sdk_wifi_get_opmode() == STATION_MODE && !context->first_time)
+                                continue;
+
+                        INFO("Connected to WiFi network");
+
+                        wifi_config_softap_stop();
+                        sdk_wifi_station_set_auto_connect(false);
+
+                        if (context->on_event)
+                                context->on_event(WIFI_CONFIG_CONNECTED);
+
+                        context->first_time = false;
+
+                        xTimerChangePeriod(
+                                context->network_monitor_timer,
+                                pdMS_TO_TICKS(WIFI_CONFIG_CONNECTED_MONITOR_INTERVAL), 0);
+
+                }
+                
+                else {
+                        if (wifi_config_has_configuration())
+                                wifi_config_station_connect();
+
+                        if (sdk_wifi_get_opmode() != STATION_MODE)
+                                continue;
+
+                        INFO("Disconnected from WiFi network");
+
+                        if (!context->first_time && context->on_event)
+                                context->on_event(WIFI_CONFIG_DISCONNECTED);
+
+                        xTimerChangePeriod(
+                                context->network_monitor_timer,
+                                pdMS_TO_TICKS(WIFI_CONFIG_DISCONNECTED_MONITOR_INTERVAL), 0);
+
+                        wifi_config_softap_start();
+                }
+        }
+}
 
 
 
@@ -800,6 +848,8 @@ static void dns_stop() {
 static void wifi_config_softap_start() {
         INFO("Starting AP mode");
 
+        esp_wifi_disconnect();
+
         sdk_wifi_set_opmode(STATIONAP_MODE);
 
         uint8_t macaddr[6];
@@ -846,45 +896,8 @@ static void wifi_config_softap_stop() {
 
 
 static void wifi_config_monitor_callback(TimerHandle_t xTimer) {
-        if (sdk_wifi_station_get_connect_status() == STATION_GOT_IP) {
-                if (sdk_wifi_get_opmode() == STATION_MODE && !context->first_time)
-                        return;
-
-                // Connected to station, all is dandy
-                INFO("Connected to WiFi network");
-
-                wifi_config_softap_stop();
-                sdk_wifi_station_set_auto_connect(false);
-
-                if (context->on_event)
-                        context->on_event(WIFI_CONFIG_CONNECTED);
-
-                context->first_time = false;
-
-                // change monitoring poll interval
-                xTimerChangePeriod(
-                        context->network_monitor_timer,
-                        pdMS_TO_TICKS(WIFI_CONFIG_CONNECTED_MONITOR_INTERVAL), 0);
-
-                return;
-        } else {
-                if (wifi_config_has_configuration())
-                        wifi_config_station_connect();
-
-                if (sdk_wifi_get_opmode() != STATION_MODE)
-                        return;
-
-                INFO("Disconnected from WiFi network");
-
-                if (!context->first_time && context->on_event)
-                        context->on_event(WIFI_CONFIG_DISCONNECTED);
-
-                // change monitoring poll interval
-                xTimerChangePeriod(
-                        context->network_monitor_timer,
-                        pdMS_TO_TICKS(WIFI_CONFIG_DISCONNECTED_MONITOR_INTERVAL), 0);
-
-                wifi_config_softap_start();
+        if (wifi_monitor_task_handle) {
+                xTaskNotify(wifi_monitor_task_handle, 1, eSetValueWithOverwrite);
         }
 }
 
@@ -943,6 +956,10 @@ void wifi_config_start() {
         sdk_wifi_set_opmode(STATION_MODE);
 
         context->first_time = true;
+
+        if (!wifi_monitor_task_handle) {
+                xTaskCreate(wifi_monitor_task, "wifi_cfg_mon_task", 4096, NULL, 3, &wifi_monitor_task_handle );
+        }
 
         if (wifi_config_station_connect()) {
                 wifi_config_softap_start();
